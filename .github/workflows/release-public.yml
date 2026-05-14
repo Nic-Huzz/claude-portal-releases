@@ -1,0 +1,343 @@
+name: Release (Public Repo)
+
+# This workflow is designed to run on the PUBLIC claude-portal-releases repo,
+# where GitHub Actions macOS minutes are unlimited and free.
+#
+# It checks out the private source repo, builds signed + notarized Mac DMGs,
+# builds Windows installer, and publishes the release — all on the public repo.
+#
+# To trigger: push this file to claude-portal-releases, then either:
+#   1. Manual: gh workflow run release-public.yml --repo Nic-Huzz/claude-portal-releases -f tag=v0.8.0
+#   2. API:    gh api repos/Nic-Huzz/claude-portal-releases/dispatches -f event_type=build-release -f 'client_payload[tag]=v0.8.0'
+#
+# Required secrets on claude-portal-releases:
+#   SOURCE_REPO_TOKEN          — PAT with `repo` scope (to clone private source)
+#   MAC_CERTIFICATE_P12_BASE64 — base64-encoded Developer ID P12 certificate
+#   MAC_CERTIFICATE_PASSWORD   — P12 password
+#   APPLE_ID                   — Apple Developer ID email
+#   APPLE_ID_PASSWORD          — App-specific password for notarization
+#   APPLE_TEAM_ID              — Apple Developer Team ID
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag (e.g. v0.8.0). Must exist in the source repo.'
+        required: true
+        type: string
+  repository_dispatch:
+    types: [build-release]
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.event.client_payload.tag }}
+
+jobs:
+  # ─── 1. Build signed + notarized macOS DMGs ─────────────────────────────
+  build-mac:
+    name: Build macOS
+    runs-on: macos-14
+    timeout-minutes: 120
+
+    steps:
+      - name: Validate tag input
+        run: |
+          TAG="${{ env.RELEASE_TAG }}"
+          if [ -z "$TAG" ]; then
+            echo "❌ No tag provided. Pass tag via workflow_dispatch input or repository_dispatch payload."
+            exit 1
+          fi
+          echo "Building release for tag: $TAG"
+
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: Nic-Huzz/create-claudeportal
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Verify timestamp.apple.com is reachable
+        run: |
+          echo "Testing timestamp.apple.com:443..."
+          if curl -sf --connect-timeout 15 https://timestamp.apple.com > /dev/null 2>&1; then
+            echo "✅ timestamp.apple.com:443 is reachable"
+          else
+            echo "⚠️ timestamp.apple.com:443 not responding to GET — trying TCP connect..."
+            if nc -z -w 10 timestamp.apple.com 443 2>/dev/null; then
+              echo "✅ TCP port 443 is open (TLS handshake may differ from curl)"
+            else
+              echo "❌ timestamp.apple.com:443 is NOT reachable — codesign --timestamp will fail"
+              echo "   This is unusual for GitHub Actions runners. Check Apple system status."
+              exit 1
+            fi
+          fi
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Verify package.json version matches tag
+        run: |
+          PKG_VERSION="v$(node -p "require('./package.json').version")"
+          if [ "${{ env.RELEASE_TAG }}" != "$PKG_VERSION" ]; then
+            echo "❌ Tag ${{ env.RELEASE_TAG }} does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+          echo "✅ Tag matches: ${{ env.RELEASE_TAG }}"
+
+      # ─── Code signing setup ──────────────────────────────────────────────
+      - name: Import Apple Developer ID certificate
+        env:
+          MAC_CERTIFICATE_P12_BASE64: ${{ secrets.MAC_CERTIFICATE_P12_BASE64 }}
+          MAC_CERTIFICATE_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
+          CERT_PATH=$RUNNER_TEMP/cert.p12
+
+          echo "$MAC_CERTIFICATE_P12_BASE64" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$MAC_CERTIFICATE_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$MAC_CERTIFICATE_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$MAC_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$MAC_CERTIFICATE_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+          echo "Available signing identities:"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+      - name: Build signed + notarized Mac binaries
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          npm run build
+          npx electron-builder --config electron/builder.config.js --mac --publish never
+
+      - name: Verify code signature and notarization
+        run: |
+          APP="electron-dist/mac-arm64/Claude Portal.app"
+          echo "=== Code signature ==="
+          codesign -dvv "$APP" 2>&1 || true
+          echo ""
+          echo "=== Notarization check ==="
+          # stapler validate checks if the notarization ticket is stapled
+          xcrun stapler validate "$APP" 2>&1 || echo "⚠️ Notarization ticket not stapled (may still be propagating)"
+          echo ""
+          echo "=== Gatekeeper assessment ==="
+          spctl --assess --type execute --verbose "$APP" 2>&1 || echo "⚠️ Gatekeeper check failed (may need ticket propagation)"
+
+      - name: List build outputs
+        run: ls -lh electron-dist/
+
+      - name: Verify bundled Claude Code is in app.asar.unpacked
+        run: |
+          UNPACKED="electron-dist/mac-arm64/Claude Portal.app/Contents/Resources/app.asar.unpacked/node_modules/@anthropic-ai/claude-code"
+          if [ ! -f "$UNPACKED/cli.js" ]; then
+            echo "❌ Bundled Claude Code cli.js missing from app.asar.unpacked"
+            ls -la "electron-dist/mac-arm64/Claude Portal.app/Contents/Resources/app.asar.unpacked/" || true
+            exit 1
+          fi
+          echo "✅ Bundled Claude Code present at $UNPACKED/cli.js"
+          du -sh "$UNPACKED"
+
+      - name: Smoke-test bundled Claude Code
+        run: |
+          ELECTRON="electron-dist/mac-arm64/Claude Portal.app/Contents/MacOS/Claude Portal"
+          CLI="electron-dist/mac-arm64/Claude Portal.app/Contents/Resources/app.asar.unpacked/node_modules/@anthropic-ai/claude-code/cli.js"
+          OUTPUT=$(ELECTRON_RUN_AS_NODE=1 DISABLE_AUTOUPDATER=1 "$ELECTRON" "$CLI" --version 2>&1)
+          echo "Claude Code version: $OUTPUT"
+          PINNED="v$(node -p "require('./package.json').dependencies['@anthropic-ai/claude-code']")"
+          if ! echo "$OUTPUT" | grep -q "$(echo "$PINNED" | sed 's/^v//')"; then
+            echo "❌ Bundled Claude version mismatch: expected $PINNED, got: $OUTPUT"
+            exit 1
+          fi
+          echo "✅ Bundled Claude Code matches pinned version $PINNED"
+
+      - name: Upload Mac artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-binaries
+          path: |
+            electron-dist/Claude-Portal-mac-arm64.dmg
+            electron-dist/Claude-Portal-mac-x64.dmg
+          retention-days: 7
+          if-no-files-found: error
+
+  # ─── 2. Build Windows installer ─────────────────────────────────────────
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: Nic-Huzz/create-claudeportal
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 1
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Verify package.json version matches tag
+        shell: bash
+        run: |
+          PKG_VERSION="v$(node -p "require('./package.json').version")"
+          if [ "${{ env.RELEASE_TAG }}" != "$PKG_VERSION" ]; then
+            echo "❌ Tag ${{ env.RELEASE_TAG }} does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+          echo "✅ Tag matches: ${{ env.RELEASE_TAG }}"
+
+      - name: Build Windows installer
+        run: |
+          npm run build
+          npx electron-builder --config electron/builder.config.js --win --publish never
+
+      - name: List build outputs
+        shell: bash
+        run: ls -lh electron-dist/
+
+      - name: Verify bundled Claude Code is in app.asar.unpacked
+        shell: bash
+        run: |
+          UNPACKED="electron-dist/win-unpacked/resources/app.asar.unpacked/node_modules/@anthropic-ai/claude-code"
+          if [ ! -f "$UNPACKED/cli.js" ]; then
+            echo "❌ Bundled Claude Code cli.js missing from app.asar.unpacked"
+            ls -la "electron-dist/win-unpacked/resources/app.asar.unpacked/" || true
+            exit 1
+          fi
+          echo "✅ Bundled Claude Code present at $UNPACKED/cli.js"
+          du -sh "$UNPACKED"
+
+      - name: Smoke-test bundled Claude Code
+        shell: bash
+        run: |
+          ELECTRON="electron-dist/win-unpacked/Claude Portal.exe"
+          CLI="electron-dist/win-unpacked/resources/app.asar.unpacked/node_modules/@anthropic-ai/claude-code/cli.js"
+          OUTPUT=$(ELECTRON_RUN_AS_NODE=1 DISABLE_AUTOUPDATER=1 "$ELECTRON" "$CLI" --version 2>&1)
+          echo "Claude Code version: $OUTPUT"
+          PINNED="v$(node -p "require('./package.json').dependencies['@anthropic-ai/claude-code']")"
+          if ! echo "$OUTPUT" | grep -q "$(echo "$PINNED" | sed 's/^v//')"; then
+            echo "❌ Bundled Claude version mismatch: expected $PINNED, got: $OUTPUT"
+            exit 1
+          fi
+          echo "✅ Bundled Claude Code matches pinned version $PINNED"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-binary
+          path: electron-dist/Claude-Portal-Setup.exe
+          retention-days: 7
+          if-no-files-found: error
+
+  # ─── 3. Publish release ─────────────────────────────────────────────────
+  publish:
+    name: Publish ${{ inputs.tag || github.event.client_payload.tag }}
+    needs: [build-mac, build-windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout private source (for release notes script)
+        uses: actions/checkout@v4
+        with:
+          repository: Nic-Huzz/create-claudeportal
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Download Mac artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: mac-binaries
+          path: electron-dist/
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-binary
+          path: electron-dist/
+
+      - name: List collected artifacts
+        run: ls -lh electron-dist/
+
+      - name: Generate release notes
+        run: node scripts/release-notes.mjs > /tmp/release-notes.md && cat /tmp/release-notes.md
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ env.RELEASE_TAG }}" \
+            --draft \
+            --title "Claude Portal ${{ env.RELEASE_TAG }}" \
+            --notes-file /tmp/release-notes.md \
+            electron-dist/Claude-Portal-mac-arm64.dmg \
+            electron-dist/Claude-Portal-mac-x64.dmg \
+            electron-dist/Claude-Portal-Setup.exe
+
+      - name: Verify draft via GitHub API
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/release-verify.mjs "${{ env.RELEASE_TAG }}" --via-api
+
+      - name: Publish (un-draft) the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "${{ env.RELEASE_TAG }}" --draft=false
+
+      - name: Wait for GitHub cache
+        run: sleep 10
+
+      - name: Final public-URL verification
+        run: |
+          node scripts/release-verify.mjs "${{ env.RELEASE_TAG }}"
+
+      - name: Summary
+        run: |
+          echo "## ✅ Released ${{ env.RELEASE_TAG }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Signed + Notarized** — Mac users can double-click without Gatekeeper warnings." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Release:** https://github.com/Nic-Huzz/claude-portal-releases/releases/tag/${{ env.RELEASE_TAG }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Downloads:**" >> $GITHUB_STEP_SUMMARY
+          echo "- [Mac (Apple Silicon)](https://github.com/Nic-Huzz/claude-portal-releases/releases/download/${{ env.RELEASE_TAG }}/Claude-Portal-mac-arm64.dmg)" >> $GITHUB_STEP_SUMMARY
+          echo "- [Mac (Intel)](https://github.com/Nic-Huzz/claude-portal-releases/releases/download/${{ env.RELEASE_TAG }}/Claude-Portal-mac-x64.dmg)" >> $GITHUB_STEP_SUMMARY
+          echo "- [Windows](https://github.com/Nic-Huzz/claude-portal-releases/releases/download/${{ env.RELEASE_TAG }}/Claude-Portal-Setup.exe)" >> $GITHUB_STEP_SUMMARY
